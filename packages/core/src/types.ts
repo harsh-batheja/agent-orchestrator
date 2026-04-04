@@ -1,5 +1,4 @@
 import type { ObservabilityLevel } from "./observability.js";
-import type { ConfigMode } from "./global-config.js";
 
 /**
  * Agent Orchestrator — Core Type Definitions
@@ -190,14 +189,37 @@ export interface Session {
   metadata: Record<string, string>;
 }
 
-/** Matches the base orchestrator session ID suffix (-orchestrator). */
-const ORCHESTRATOR_ID_PATTERN = /-orchestrator$/;
-
-export function isOrchestratorSession(session: {
-  id: SessionId;
-  metadata?: Record<string, string>;
-}): boolean {
-  return session.metadata?.["role"] === "orchestrator" || ORCHESTRATOR_ID_PATTERN.test(session.id);
+export function isOrchestratorSession(
+  session: { id: SessionId; metadata?: Record<string, string> },
+  sessionPrefix?: string,
+  allSessionPrefixes?: string[],
+): boolean {
+  if (session.metadata?.["role"] === "orchestrator" || session.id.endsWith("-orchestrator")) {
+    return true;
+  }
+  if (!sessionPrefix) {
+    return false;
+  }
+  const escaped = sessionPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!new RegExp(`^${escaped}-orchestrator-\\d+$`).test(session.id)) {
+    return false;
+  }
+  // Guard against cross-project false positives: if the session ID is a plain
+  // numbered worker for any other known prefix (e.g. prefix "app-orchestrator"
+  // matches "app-orchestrator-1" as a worker), it is not an orchestrator.
+  if (allSessionPrefixes) {
+    for (const prefix of allSessionPrefixes) {
+      if (prefix === sessionPrefix) continue;
+      if (
+        new RegExp(
+          `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d+$`,
+        ).test(session.id)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 /** Config for creating a new session */
@@ -220,8 +242,6 @@ export interface SessionSpawnConfig {
 export interface OrchestratorSpawnConfig {
   projectId: string;
   systemPrompt?: string;
-  /** Optional suffix for additional orchestrators, e.g. "2" → "{prefix}-orchestrator-2" */
-  sessionSuffix?: string;
 }
 
 // =============================================================================
@@ -990,12 +1010,6 @@ export interface OrchestratorConfig {
    */
   configPath: string;
 
-  /**
-   * Path to the global config file (multi-project mode).
-   * Set when loaded via global config. Undefined in legacy single-file mode.
-   */
-  globalConfigPath?: string;
-
   /** Web dashboard port (defaults to 3000) */
   port?: number;
 
@@ -1017,9 +1031,6 @@ export interface OrchestratorConfig {
   /** Project configurations */
   projects: Record<string, ProjectConfig>;
 
-  /** Display order for projects in sidebar/portfolio */
-  projectOrder?: string[];
-
   /** Notification channel configs */
   notifiers: Record<string, NotifierConfig>;
 
@@ -1028,6 +1039,55 @@ export interface OrchestratorConfig {
 
   /** Default reaction configs */
   reactions: Record<string, ReactionConfig>;
+
+  /**
+   * Internal: External plugin entries collected from inline tracker/scm/notifier configs.
+   * Used by plugin-registry for manifest validation. Set automatically during config validation.
+   */
+  _externalPluginEntries?: ExternalPluginEntryRef[];
+
+  /**
+   * Multi-project mode: path to the global config file (~/.agent-orchestrator/config.yaml).
+   * Present only when config was loaded via the global registry (not a local config file).
+   */
+  globalConfigPath?: string;
+
+  /**
+   * Multi-project mode: ordered list of project IDs for display.
+   * Controls the order projects appear in the dashboard sidebar.
+   */
+  projectOrder?: string[];
+}
+
+/**
+ * Structured location of an external plugin config.
+ * Used to update config with manifest.name after loading (avoids parsing dotted strings).
+ */
+export type ExternalPluginLocation =
+  | { kind: "project"; projectId: string; configType: "tracker" | "scm" }
+  | { kind: "notifier"; notifierId: string };
+
+/**
+ * Reference to an external plugin config (from inline tracker/scm/notifier configs).
+ * Used for manifest.name validation during plugin loading.
+ */
+export interface ExternalPluginEntryRef {
+  /** Where this config came from (for error messages) */
+  source: string;
+  /** Structured location for updating config (avoids parsing source string) */
+  location: ExternalPluginLocation;
+  /** The slot this plugin fills */
+  slot: "tracker" | "scm" | "notifier";
+  /** npm package name (if specified) */
+  package?: string;
+  /** Local path (if specified) */
+  path?: string;
+  /**
+   * Expected plugin name (manifest.name).
+   * Only set when user explicitly specified `plugin` field.
+   * When undefined, any manifest.name is accepted and config is updated with it.
+   */
+  expectedPluginName?: string;
 }
 
 export interface DefaultPlugins {
@@ -1086,9 +1146,6 @@ export interface ProjectConfig {
   /** Session name prefix (e.g. "app" → "app-1", "app-2") */
   sessionPrefix: string;
 
-  /** Config ownership mode (set at runtime, not persisted) */
-  configMode?: ConfigMode;
-
   /** Override default runtime */
   runtime?: string;
 
@@ -1137,6 +1194,14 @@ export interface ProjectConfig {
     | "ignore-new"
     | "kill-previous";
 
+  /**
+   * Multi-project mode: how this project's config is owned.
+   * "hybrid" = local config is source of truth, shadow is a cache.
+   * "global-only" = shadow file IS the authoritative config.
+   * Absent in single-project (local-config-only) mode.
+   */
+  configMode?: "hybrid" | "global-only";
+
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
 
   /** Task decomposition configuration */
@@ -1153,13 +1218,41 @@ export interface ProjectConfig {
 }
 
 export interface TrackerConfig {
-  plugin: string;
+  /**
+   * Plugin name (manifest.name). Required when using built-in plugins.
+   * Optional when `package` or `path` is specified (will be inferred from manifest).
+   * When both plugin and package/path are specified, manifest.name must match plugin.
+   *
+   * POST-VALIDATION INVARIANT: After validateConfig(), this field is ALWAYS populated.
+   * Either from user input, inferred from repo (github/gitlab), or auto-generated from
+   * package/path via generateTempPluginName(). The optional typing exists for raw config
+   * input before validation. Downstream code can safely assume non-null after validation.
+   */
+  plugin?: string;
+  /** npm package name for external plugins (e.g. "@acme/ao-plugin-tracker-jira") */
+  package?: string;
+  /** Local filesystem path for external plugins (relative to config file or absolute) */
+  path?: string;
   /** Plugin-specific config (e.g. teamId for Linear) */
   [key: string]: unknown;
 }
 
 export interface SCMConfig {
-  plugin: string;
+  /**
+   * Plugin name (manifest.name). Required when using built-in plugins.
+   * Optional when `package` or `path` is specified (will be inferred from manifest).
+   * When both plugin and package/path are specified, manifest.name must match plugin.
+   *
+   * POST-VALIDATION INVARIANT: After validateConfig(), this field is ALWAYS populated.
+   * Either from user input, inferred from repo (github/gitlab), or auto-generated from
+   * package/path via generateTempPluginName(). The optional typing exists for raw config
+   * input before validation. Downstream code can safely assume non-null after validation.
+   */
+  plugin?: string;
+  /** npm package name for external plugins (e.g. "@acme/ao-plugin-scm-bitbucket") */
+  package?: string;
+  /** Local filesystem path for external plugins (relative to config file or absolute) */
+  path?: string;
   webhook?: SCMWebhookConfig;
   [key: string]: unknown;
 }
@@ -1175,7 +1268,21 @@ export interface SCMWebhookConfig {
 }
 
 export interface NotifierConfig {
-  plugin: string;
+  /**
+   * Plugin name (manifest.name). Required when using built-in plugins.
+   * Optional when `package` or `path` is specified (will be inferred from manifest).
+   * When both plugin and package/path are specified, manifest.name must match plugin.
+   *
+   * POST-VALIDATION INVARIANT: After validateConfig(), this field is ALWAYS populated.
+   * Either from user input or auto-generated from package/path via generateTempPluginName().
+   * The optional typing exists for raw config input before validation.
+   * Downstream code can safely assume non-null after validation.
+   */
+  plugin?: string;
+  /** npm package name for external plugins (e.g. "@acme/ao-plugin-notifier-teams") */
+  package?: string;
+  /** Local filesystem path for external plugins (relative to config file or absolute) */
+  path?: string;
   [key: string]: unknown;
 }
 

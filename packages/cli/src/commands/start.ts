@@ -960,9 +960,7 @@ async function runStartup(
     }
   }
 
-  const sessionId = opts?.orchestratorSuffix
-    ? `${project.sessionPrefix}-orchestrator-${opts.orchestratorSuffix}`
-    : `${project.sessionPrefix}-orchestrator`;
+  const sessionId = `${project.sessionPrefix}-orchestrator`;
   const shouldStartLifecycle = opts?.dashboard !== false || opts?.orchestrator !== false;
   let lifecycleStatus: Awaited<ReturnType<typeof ensureLifecycleWorker>> | null = null;
   let port = config.port ?? DEFAULT_PORT;
@@ -1039,7 +1037,6 @@ async function runStartup(
       const session = await sm.spawnOrchestrator({
         projectId,
         systemPrompt,
-        sessionSuffix: opts?.orchestratorSuffix,
       });
       if (session.runtimeHandle?.id) {
         tmuxTarget = session.runtimeHandle.id;
@@ -1163,7 +1160,6 @@ export function registerStart(program: Command): void {
           orchestrator?: boolean;
           rebuild?: boolean;
           interactive?: boolean;
-          orchestratorSuffix?: string;
         },
       ) => {
         try {
@@ -1285,18 +1281,10 @@ export function registerStart(program: Command): void {
                 openUrl(url);
                 process.exit(0);
               } else if (choice === "new") {
-                // Spawn an additional orchestrator for the same project.
-                // Find the next available suffix (2, 3, 4...) by checking existing sessions.
-                const sm = await getSessionManager(config);
-                const sessions = await sm.list(projectId);
-                const orchPrefix = `${project.sessionPrefix}-orchestrator`;
-                let suffix = 2;
-                while (sessions.some((s) => s.id === `${orchPrefix}-${suffix}`)) suffix++;
-
                 if (config.globalConfigPath) {
-                  // Multi-project mode: pass suffix to runStartup
-                  opts = { ...opts, orchestratorSuffix: String(suffix) };
-                  console.log(chalk.green(`\n✓ Starting orchestrator-${suffix} for "${projectId}"\n`));
+                  // Multi-project mode: spawnOrchestrator auto-reserves the next available
+                  // numbered identity ({prefix}-orchestrator-N) via reserveNextOrchestratorIdentity.
+                  console.log(chalk.green(`\n✓ Starting new orchestrator for "${projectId}"\n`));
                 } else {
                   // Legacy single-file mode: add a new project entry with different prefix
                   const existingIds = new Set(Object.keys(config.projects));
@@ -1321,15 +1309,7 @@ export function registerStart(program: Command): void {
                     if (reloadedProject) {
                       projectId = newId;
                       project = reloadedProject;
-                    } else {
-                      // Config reload didn't surface the new entry — fall back to suffix
-                      opts = { ...opts, orchestratorSuffix: String(suffix) };
-                      console.log(chalk.green(`\n✓ Starting orchestrator-${suffix} for "${projectId}"\n`));
                     }
-                  } else {
-                    // Project not found in raw YAML (unexpected — fall back to suffix approach)
-                    opts = { ...opts, orchestratorSuffix: String(suffix) };
-                    console.log(chalk.green(`\n✓ Starting orchestrator-${suffix} for "${projectId}"\n`));
                   }
                 }
               } else if (choice === "restart") {
