@@ -73,6 +73,23 @@ describe("lifecycle-service (in-process)", () => {
       expect(mockGetLifecycleManager).toHaveBeenCalledWith(config, "project-a");
       expect(mockGetLifecycleManager).toHaveBeenCalledWith(config, "project-b");
     });
+
+    it("restarts manager when config fingerprint changes", async () => {
+      await ensureLifecycleWorker(config, "my-project");
+      expect(mockGetLifecycleManager).toHaveBeenCalledTimes(1);
+
+      // Simulate config reload — new object with different content
+      const updatedConfig = { ...config, _updated: true } as unknown as OrchestratorConfig;
+      mockGetLifecycleManager.mockClear();
+      mockLifecycleStart.mockClear();
+
+      const status = await ensureLifecycleWorker(updatedConfig, "my-project");
+
+      expect(mockLifecycleStop).toHaveBeenCalledTimes(1); // old manager stopped
+      expect(mockGetLifecycleManager).toHaveBeenCalledTimes(1); // new manager created
+      expect(mockLifecycleStart).toHaveBeenCalledWith(30_000);
+      expect(status.started).toBe(true);
+    });
   });
 
   describe("stopLifecycleWorker", () => {

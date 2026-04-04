@@ -1374,8 +1374,15 @@ export function registerStart(program: Command): void {
                   localRaw["orchestrator"] = { ...(localRaw["orchestrator"] as Record<string, unknown> ?? {}), agent: orchestratorAgent };
                   localRaw["worker"] = { ...(localRaw["worker"] as Record<string, unknown> ?? {}), agent: workerAgent };
                   writeFileSync(localConfigPath, yamlStringify(localRaw, { indent: 2 }));
-                } catch {
-                  // Local config update failed — shadow still has the values
+                } catch (err) {
+                  // Local config update failed — shadow has the values but they won't
+                  // persist across `ao start` in hybrid mode (local config is source of truth).
+                  console.warn(
+                    chalk.yellow(
+                      `  ⚠ Could not update local config at ${localConfigPath}: agent override will not persist after the next ao start.\n` +
+                      `    Update it manually: set orchestrator.agent=${orchestratorAgent} and worker.agent=${workerAgent}.`,
+                    ),
+                  );
                 }
               }
               console.log(chalk.dim(`  ✓ Saved agent config\n`));
