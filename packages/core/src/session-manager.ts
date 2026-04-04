@@ -292,19 +292,31 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     sourceSessionId: string;
   } | null {
     const sessionsDir = getProjectSessionsDir(project);
-    const orchestratorId = `${project.sessionPrefix}-orchestrator`;
-    const orchestratorRaw = readMetadataRaw(sessionsDir, orchestratorId);
-    if (!orchestratorRaw) return null;
 
-    const until = parsePauseUntil(orchestratorRaw[GLOBAL_PAUSE_UNTIL_KEY]);
-    if (!until) return null;
-    if (until.getTime() <= Date.now()) return null;
+    // Scan session IDs for orchestrators belonging to this project.
+    // Use the project's session prefix for accurate matching — the generic regex
+    // /-orchestrator(-\d+)?$/ would false-positive on worker sessions like
+    // "my-orchestrator-1" when the sessionPrefix itself ends with "-orchestrator".
+    const orchestratorPrefix = `${project.sessionPrefix}-orchestrator`;
+    const candidates = listMetadata(sessionsDir).filter(
+      (id) => id === orchestratorPrefix || id.startsWith(`${orchestratorPrefix}-`),
+    );
 
-    return {
-      until,
-      reason: orchestratorRaw[GLOBAL_PAUSE_REASON_KEY] ?? "Model rate limit reached",
-      sourceSessionId: orchestratorRaw[GLOBAL_PAUSE_SOURCE_KEY] ?? "unknown",
-    };
+    for (const candidateId of candidates) {
+      const raw = readMetadataRaw(sessionsDir, candidateId);
+      if (!raw) continue;
+
+      const until = parsePauseUntil(raw[GLOBAL_PAUSE_UNTIL_KEY]);
+      if (!until || until.getTime() <= Date.now()) continue;
+
+      return {
+        until,
+        reason: raw[GLOBAL_PAUSE_REASON_KEY] ?? "Model rate limit reached",
+        sourceSessionId: raw[GLOBAL_PAUSE_SOURCE_KEY] ?? "unknown",
+      };
+    }
+
+    return null;
   }
 
   function normalizePath(path: string): string {
@@ -358,9 +370,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   function isOrchestratorSessionRecord(
     sessionId: string,
     raw: Record<string, string> | null | undefined,
+    project?: ProjectConfig,
   ): boolean {
     if (!raw) return false;
-    return raw["role"] === "orchestrator" || sessionId.endsWith("-orchestrator");
+    if (raw["role"] === "orchestrator") return true;
+    // Prefix-based check for suffixed orchestrators (e.g. {prefix}-orchestrator-2)
+    // when project context is available. The regex /-orchestrator$/ only matches
+    // the base form and would miss suffix variants when role metadata is absent.
+    if (project) {
+      const canonicalId = `${project.sessionPrefix}-orchestrator`;
+      if (sessionId === canonicalId || sessionId.startsWith(`${canonicalId}-`)) return true;
+    }
+    return isOrchestratorSession({ id: sessionId, metadata: raw });
   }
 
   function isCleanupProtectedSession(
@@ -369,8 +390,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     metadata?: Record<string, string> | null,
   ): boolean {
     const canonicalOrchestratorId = `${project.sessionPrefix}-orchestrator`;
+    // Prefix-based check protects suffixed orchestrators (e.g. -orchestrator-2)
+    // even when metadata is unavailable (deleted or corrupted), without introducing
+    // false positives that a broader regex would.
+    const isSuffixedOrchestrator = sessionId.startsWith(`${canonicalOrchestratorId}-`);
     return (
       sessionId === canonicalOrchestratorId ||
+      isSuffixedOrchestrator ||
       isOrchestratorSession({ id: sessionId, metadata: metadata ?? undefined })
     );
   }
@@ -422,9 +448,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   function repairSingleSessionMetadataOnRead(
     sessionsDir: string,
     record: ActiveSessionRecord,
+    project?: ProjectConfig,
   ): ActiveSessionRecord {
     const repaired = { ...record, raw: { ...record.raw } };
-    if (!isOrchestratorSessionRecord(repaired.sessionName, repaired.raw)) {
+    if (!isOrchestratorSessionRecord(repaired.sessionName, repaired.raw, project)) {
       return repaired;
     }
 
@@ -464,13 +491,14 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   function repairSessionMetadataOnRead(
     sessionsDir: string,
     records: ActiveSessionRecord[],
+    project?: ProjectConfig,
   ): ActiveSessionRecord[] {
     const repaired = records.map((record) => ({ ...record, raw: { ...record.raw } }));
     const duplicatePRAttachments = new Map<string, ActiveSessionRecord[]>();
 
     for (const record of repaired) {
-      if (isOrchestratorSessionRecord(record.sessionName, record.raw)) {
-        record.raw = repairSingleSessionMetadataOnRead(sessionsDir, record).raw;
+      if (isOrchestratorSessionRecord(record.sessionName, record.raw, project)) {
+        record.raw = repairSingleSessionMetadataOnRead(sessionsDir, record, project).raw;
         continue;
       }
 
@@ -531,7 +559,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       return [{ sessionName, raw, modifiedAt } satisfies ActiveSessionRecord];
     });
 
-    return repairSessionMetadataOnRead(sessionsDir, records);
+    return repairSessionMetadataOnRead(sessionsDir, records, project);
   }
 
   function markArchivedOpenCodeCleanup(sessionsDir: string, sessionId: SessionId): void {
@@ -769,7 +797,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         sessionName: sessionId,
         raw,
         modifiedAt,
-      });
+      }, project);
 
       return { raw: repaired.raw, sessionsDir, project, projectId };
     }
@@ -1247,7 +1275,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       throw new Error(`Agent plugin '${selection.agentName}' not found`);
     }
 
-    const sessionId = `${project.sessionPrefix}-orchestrator`;
+    const sessionId = orchestratorConfig.sessionSuffix
+      ? `${project.sessionPrefix}-orchestrator-${orchestratorConfig.sessionSuffix}`
+      : `${project.sessionPrefix}-orchestrator`;
     const orchestratorSessionStrategy = normalizeOrchestratorSessionStrategy(
       project.orchestratorSessionStrategy,
     );
@@ -1564,7 +1594,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         sessionName: sessionId,
         raw,
         modifiedAt,
-      });
+      }, project);
 
       const session = metadataToSession(sessionId, repaired.raw, projectId, createdAt, modifiedAt);
 
@@ -1815,8 +1845,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   async function send(sessionId: SessionId, message: string): Promise<void> {
     const { raw, sessionsDir, project } = requireSessionRecord(sessionId);
     const pause = getProjectPause(project);
-    const orchestratorId = `${project.sessionPrefix}-orchestrator`;
-    if (pause && sessionId !== orchestratorId) {
+    if (pause && !isOrchestratorSessionRecord(sessionId, raw, project)) {
       throw new Error(
         `Project is paused due to model rate limit until ${pause.until.toISOString()} (${pause.reason}; source: ${pause.sourceSessionId})`,
       );
@@ -2108,7 +2137,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     if (!reference) throw new Error("PR reference is required");
 
     const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId);
-    if (isOrchestratorSessionRecord(sessionId, raw)) {
+    if (isOrchestratorSessionRecord(sessionId, raw, project)) {
       throw new Error(`Session ${sessionId} is an orchestrator session and cannot claim PRs`);
     }
 
@@ -2135,7 +2164,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     );
 
     for (const { sessionName, raw: otherRaw } of activeRecords) {
-      if (!otherRaw || isOrchestratorSessionRecord(sessionName, otherRaw)) continue;
+      if (!otherRaw || isOrchestratorSessionRecord(sessionName, otherRaw, project)) continue;
 
       const samePr = otherRaw["pr"] === pr.url;
       const sameBranch =
